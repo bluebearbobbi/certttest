@@ -1,0 +1,22 @@
+The error occurs because the `alpine` Docker image is minimal and doesn't include OpenSSL by default—it's not in the `$PATH` inside the container. This is a common issue with lightweight images like Alpine. Here's the quickest fix: modify the verification command in Step 5 to temporarily install OpenSSL inside the container using Alpine's package manager (`apk`). No need to rebuild anything or change your setup.
+
+### Updated Step 5: Verify and Restart
+Run this revised command to check the expiry (it should still show ~Nov 22, 2025):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine sh -c "apk add --no-cache openssl && openssl x509 -in /certs/server.pem -text -noout | grep 'Not After'"
+```
+
+- The `--no-cache` flag keeps the container lightweight by avoiding package cache storage.
+- If you prefer a pre-installed image (no install step), swap `alpine` for `ubuntu` (which has OpenSSL built-in):
+  ```
+  docker run --rm -v blackduck_hub_cert-volume:/certs ubuntu openssl x509 -in /certs/server.pem -text -noout | grep "Not After"
+  ```
+
+The rest of the restart process remains the same:
+```
+docker stack deploy -c docker-compose.yml blackduck
+```
+
+Monitor logs as before: `docker service logs blackduck_nginx`. If the cert loads successfully, you should see the expiration alert in the UI (bell icon > Notifications) or API (`/api/notifications?filter=type%3DCERTIFICATE_EXPIRATION`) right away, since it's under the 30-day threshold.
+
+If you run into any other issues (e.g., cert validation errors in logs), share the exact error output for more targeted troubleshooting!
