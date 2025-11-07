@@ -1,0 +1,143 @@
+To generate the Black Duck Server Internal Certificate (used for internal TLS communications between containers) with a custom expiration of 15 days in a Docker Swarm deployment, note that the default generation process (via the cfssl container) uses a 1-year expiration (8760 hours). The standard regeneration method will use this default, so for a shorter lifespan, you'll need to manually generate the certificates using cfssl with a modified config, then populate the `hub_cert-volume` before restarting services. This ensures the cert expires exactly 15 days from generation time.
+
+### Prerequisites
+- Access to the Swarm manager node.
+- Docker Swarm stack deployed (assume stack name is `blackduck`—replace with yours).
+- Pull the cfssl image: `docker pull blackducksoftware/blackduck-cfssl:<your-blackduck-version>` (use the version matching your Hub deployment, e.g., `2024.10`).
+- Backup your current `hub_cert-volume` if needed: `docker run --rm -v blackduck_hub_cert-volume:/data -v $(pwd):/backup alpine tar czf /backup/hub_cert_backup.tar.gz -C /data .`
+
+### Step 1: Stop Services and Clear the Volume
+Scale down the stack to avoid conflicts:
+```
+docker stack deploy blackduck --compose-file docker-compose.yml scale webapp=0 postgres=0 nginx=0 cfssl=0  # Adjust services as needed
+```
+Remove the volume to clear old certs:
+```
+docker volume rm blackduck_hub_cert-volume
+```
+Recreate it:
+```
+docker volume create blackduck_hub_cert-volume
+```
+
+### Step 2: Manually Generate Certificates with 15-Day Expiration
+The internal cert is a root CA-signed server cert for internal use. Use cfssl to generate a new root CA and then the server cert, mounting the volume. Run these commands on the manager node in a temporary directory (e.g., `/tmp/blackduck-certs`).
+
+Create the custom root CA config (`rootCA-config.json`) with 15-day expiry (360 hours = 15*24):
+```
+cat > rootCA-config.json <<EOF
+{
+  "signing": {
+    "default": {
+      "expiry": "360h"
+    },
+    "profiles": {
+      "root-ca": {
+        "usages": ["signing", "key encipherment", "server auth", "client auth"],
+        "expiry": "360h"
+      },
+      "server": {
+        "usages": ["signing", "key encipherment", "server auth", "client auth"],
+        "expiry": "360h"
+      }
+    }
+  }
+}
+EOF
+```
+
+Create the CA CSR info (`ca-csr.json`):
+```
+cat > ca-csr.json <<EOF
+{
+  "CN": "Black Duck Root CA",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "US",
+      "ST": "California",
+      "L": "Mountain View",
+      "O": "Synopsys",
+      "OU": "Black Duck"
+    }
+  ]
+}
+EOF
+```
+
+Generate the root CA key and cert:
+```
+docker run --rm -v $(pwd):/work -v blackduck_hub_cert-volume:/certs -w /work blackducksoftware/blackduck-cfssl:latest cfssl genkey -initca ca-csr.json | cfssljson -bare ca
+docker cp $(pwd)/ca-key.pem .  # If needed for local copy
+docker cp $(pwd)/ca.pem .
+```
+
+Create the server CSR info (`server-csr.json`) for the internal server (adjust CN/SANs if needed for your internal hostname, e.g., `hub.local`):
+```
+cat > server-csr.json <<EOF
+{
+  "CN": "blackduck-server-internal",
+  "hosts": [
+    "localhost",
+    "127.0.0.1",
+    "hub.local"
+  ],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "US",
+      "ST": "California",
+      "L": "Mountain View",
+      "O": "Synopsys",
+      "OU": "Black Duck"
+    }
+  ]
+}
+EOF
+```
+
+Generate the server key and CSR:
+```
+docker run --rm -v $(pwd):/work -w /work blackducksoftware/blackduck-cfssl:latest cfssl genkey server-csr.json | cfssljson -bare server
+```
+
+Sign the server cert with the CA using the custom config:
+```
+docker run --rm -v $(pwd):/work -v blackduck_hub_cert-volume:/certs -w /work blackducksoftware/blackduck-cfssl:latest cfssl gencert -ca=ca/ca.pem -ca-key=ca/ca-key.pem -config=rootCA-config.json -profile=server server-csr.json | cfssljson -bare server
+```
+
+Copy the generated files to the volume (cfssl container expects specific paths like `/certs/ca.pem`, `/certs/server.pem`, `/certs/server-key.pem`—check your Black Duck version's expected structure via logs if needed):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine cp /work/ca.pem /certs/
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine cp /work/server.pem /certs/
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine cp /work/server-key.pem /certs/
+```
+
+Verify the expiration (should be ~15 days from now):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine openssl x509 -in /certs/server.pem -text -noout | grep "Not After"
+```
+
+### Step 3: Restart Services
+Scale the stack back up:
+```
+docker stack deploy blackduck --compose-file docker-compose.yml  # Or your deployment command
+```
+Monitor logs for cert loading:
+```
+docker service logs blackduck_cfssl
+docker service logs blackduck_nginx
+```
+The internal cert should now be in use with the 15-day expiration. Black Duck 2024.7+ will alert ~30 days before expiration, but since it's 15 days total, monitor manually via the verification command above.
+
+### Notes
+- This assumes a basic setup; adjust hostnames/SANs in `server-csr.json` based on your internal resolution (e.g., add Swarm service IPs/DNS).
+- If you encounter errors (e.g., 502 Bad Gateway), check nginx/postgres logs for cert validation issues.
+- For production, use longer expirations. Customizing beyond this may require Synopsys support for exact cfssl invocation matching your version.
+- Source: Based on Black Duck community guidance for cfssl-based cert rotation.
