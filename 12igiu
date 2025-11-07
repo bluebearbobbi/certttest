@@ -1,0 +1,113 @@
+### Diagnosis
+The error "Could not open file or uri for loading cert from /certs/server.pem no such file or directory" during verification means the expected certificate files (`server.pem`, `ca.pem`, `server-key.pem`) weren't copied into the volume successfully—or the volume is empty due to a prior recreation without the copy step. This is common if the working directory (`$(pwd)`) didn't have the files at copy time, or if there's a volume mount issue. Black Duck services will fall back to cfssl regeneration (hence the 2028 expiry), but we can fix this by inspecting the volume, regenerating if needed, and recopying.
+
+### Step 1: Inspect Volume Contents
+Run this to list what's actually in the volume (should show our PEM files if copied; if empty or only defaults, proceed to fix):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine ls -la /certs/
+```
+- **Expected if good**: Files like `ca.pem`, `server.pem`, `server-key.pem` with recent timestamps.
+- **If empty/missing**: The copy failed—jump to Step 2.
+- **If defaults present** (e.g., old `hub-server.crt` or similar): Delete them first: `docker run --rm -v blackduck_hub_cert-volume:/certs alpine rm -f /certs/*` then copy.
+
+### Step 2: Regenerate and Copy Certs (If Needed)
+If the volume is empty/missing files, regenerate the 15-day certs (using the updated configs with O="Blackduck Software Inc." from our previous response). Ensure you're in a clean directory:
+
+```
+cd /tmp/blackduck-certs  # Create if needed: mkdir -p /tmp/blackduck-certs && cd /tmp/blackduck-certs
+rm -f *.pem *.csr *.cnf  # Clear any old artifacts
+
+# Generate CA (Step 2 from before)
+openssl genrsa -out ca-key.pem 2048
+cat > ca-config.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = California
+L = Mountain View
+O = Blackduck Software Inc.
+OU = Black Duck
+CN = Black Duck Root CA
+
+[v3_ca]
+basicConstraints = critical, CA:true
+keyUsage = keyCertSign, cRLSign
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+openssl req -x509 -new -nodes -key ca-key.pem -sha256 -days 15 -out ca.pem -config ca-config.cnf
+
+# Generate Server Cert (Step 3 from before)
+openssl genrsa -out server-key.pem 2048
+cat > server-config.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = California
+L = Mountain View
+O = Blackduck Software Inc.
+OU = Black Duck
+CN = blackduck-server-internal
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = hub.local
+IP.1 = 127.0.0.1
+EOF
+openssl req -new -key server-key.pem -out server.csr -config server-config.cnf
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out server.pem -days 15 -sha256 -extfile server-config.cnf -extensions v3_req
+
+# Clear volume and copy (ensures clean slate)
+docker volume rm blackduck_hub_cert-volume
+docker volume create blackduck_hub_cert-volume
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine sh -c "cp /work/ca.pem /certs/ && cp /work/server.pem /certs/ && cp /work/server-key.pem /certs/"
+
+# Verify copy and expiry (should succeed now, showing ~Nov 22, 2025)
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine sh -c "apk add --no-cache openssl && echo '=== Files ===' && ls -la /certs/ && echo '=== Server Cert Expiry ===' && openssl x509 -in /certs/server.pem -text -noout | grep 'Not After' && echo '=== Issuer DN ===' && openssl x509 -in /certs/server.pem -text -noout | grep -A5 'Issuer:'"
+```
+
+- If the verify still fails (e.g., OpenSSL error on issuer), share the full output—might need SAN tweaks.
+- Confirm files exist post-copy with the ls from Step 1.
+
+### Step 3: Deploy Without cfssl Overwrite
+Scale down if not already:
+```
+docker stack deploy blackduck --compose-file docker-compose.yml scale cfssl=0 webapp=0 postgres=0 nginx=0 auth-server=0 scan-server=0 certmanager=0
+```
+Then deploy (cfssl stays at 0):
+```
+docker stack deploy -c docker-compose.yml blackduck
+```
+Monitor (10-15 min for stabilization):
+```
+watch 'docker service ls | grep -v cfssl'  # Replicas to 1/1
+docker service logs -f --since 2m blackduck_nginx  # SSL load success
+docker service logs -f --since 2m blackduck_postgres  # No cert failures; "ready to accept connections"
+```
+
+### Step 4: Confirm Short Expiry in API
+Once webapp is up:
+```
+curl -H "Authorization: Bearer $TOKEN" "https://your-hub/api/cert-expiration-checks/internal"
+```
+- Look for `"expiryDate": "2025-11-22T..."` (15 days from Nov 07, 2025).
+- If still 2028, check nginx logs for load path (e.g., might expect different filenames like `hub-server.crt`—rename via copy command if so: `cp /work/server.pem /certs/hub-server.crt`).
+
+This should lock in the manual certs. If the ls shows files but verify fails, it could be a permission issue—add `chmod 644 /certs/*.pem` to the copy command. Share the ls/verify outputs if stuck!
