@@ -1,0 +1,108 @@
+The log message "Check if certificate is issued by Blackduck Software Inc." indicates that Black Duck performs a validation on the certificate's issuer Distinguished Name (DN), specifically expecting the Organization (O) field to match "Blackduck Software Inc." (a legacy name from before the Synopsys acquisition). Our previous OpenSSL-generated root CA used "Synopsys" as the O, which fails this check during service init (e.g., in Postgres or certmanager). 
+
+To fix this, we'll update the CA and server configs in Steps 2 and 3 to set O = "Blackduck Software Inc." everywhere (keeping other fields like CN and OU for compatibility). This ensures the issuer DN passes validation without altering the 15-day expiry or other aspects. Regenerate the certs and redeploy as before.
+
+### Updated Prerequisites
+Same as before, but ensure you're starting fresh:
+```
+cd /tmp/blackduck-certs  # Or your working dir
+rm -f *.pem *.csr *.cnf  # Clear old files
+docker stack deploy blackduck --compose-file docker-compose.yml scale webapp=0 postgres=0 nginx=0 cfssl=0
+docker volume rm blackduck_hub_cert-volume
+docker volume create blackduck_hub_cert-volume
+```
+
+### Updated Step 2: Generate Root CA (15-Day Expiry)
+```
+# Generate CA private key (unchanged)
+openssl genrsa -out ca-key.pem 2048
+
+# Updated CA config with correct issuer O
+cat > ca-config.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = California
+L = Mountain View
+O = Blackduck Software Inc.
+OU = Black Duck
+CN = Black Duck Root CA
+
+[v3_ca]
+basicConstraints = critical, CA:true
+keyUsage = keyCertSign, cRLSign
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+# Generate CA cert (self-signed, 15 days; unchanged command)
+openssl req -x509 -new -nodes -key ca-key.pem -sha256 -days 15 -out ca.pem -config ca-config.cnf
+```
+
+### Updated Step 3: Generate Server Cert (15-Day Expiry, Signed by CA)
+```
+# Generate server private key (unchanged)
+openssl genrsa -out server-key.pem 2048
+
+# Updated server config with matching O (for consistency in DN chain)
+cat > server-config.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = California
+L = Mountain View
+O = Blackduck Software Inc.
+OU = Black Duck
+CN = blackduck-server-internal
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = hub.local
+IP.1 = 127.0.0.1
+EOF
+
+# Generate CSR and sign (unchanged commands)
+openssl req -new -key server-key.pem -out server.csr -config server-config.cnf
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out server.pem -days 15 -sha256 -extfile server-config.cnf -extensions v3_req
+```
+
+### Step 4: Copy Certs to Volume (Unchanged)
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine sh -c "cp /work/ca.pem /certs/ && cp /work/server.pem /certs/ && cp /work/server-key.pem /certs/"
+```
+
+### Updated Step 5: Verify and Restart
+First, verify the issuer DN (should now show O=Blackduck Software Inc. for both CA and server):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine sh -c "apk add --no-cache openssl && echo '=== CA Issuer ===' && openssl x509 -in /certs/ca.pem -text -noout | grep -A5 'Issuer:' && echo '=== Server Issuer ===' && openssl x509 -in /certs/server.pem -text -noout | grep -A5 'Issuer:' && echo '=== Expiry ===' && openssl x509 -in /certs/server.pem -text -noout | grep 'Not After'"
+```
+- Expected output: Issuer lines include "O = Blackduck Software Inc." for the server cert (issued by the CA).
+
+Then restart:
+```
+docker stack deploy -c docker-compose.yml blackduck
+```
+
+### Monitoring and Next Steps
+- Tail logs: `docker service logs -f --since 2m blackduck_postgres` and `docker service logs -f --since 2m blackduck_certmanager`. The "Check if certificate is issued by Blackduck Software Inc." should now pass (look for success like "Certificate validated" or no failures). Postgres should reach "ready to accept connections" faster.
+- If auth/scan still lag, wait 10-15 min as before.
+- Once up, confirm the expiry alert in UI (bell icon > Notifications) or API (`curl -H "Authorization: Bearer $TOKEN" "https://your-hub/api/notifications?filter=type%3DCERTIFICATE_EXPIRATION"`).
+
+This tweak aligns the issuer DN with Black Duck's internal validation logic. If logs still fail validation (e.g., exact DN mismatch), share the full issuer output from the verify command for further adjustments.
