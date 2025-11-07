@@ -1,0 +1,117 @@
+Yes, there's a simpler approach than customizing the cfssl image or running ad-hoc cfssl containers: use OpenSSL directly on your Swarm manager node to generate a root CA and short-lived (15-day) internal server certificate. This avoids Docker overhead entirely, as long as you have OpenSSL installed (standard on most Linux distros; e.g., `apt install openssl` or `yum install openssl`). The resulting certs will be compatible with Black Duck's internal TLS expectations (a root CA signing a server cert with appropriate subjects/SANs for localhost/hub.local).
+
+Black Duck's internal cert expiration alert (introduced in 2024.7.0) triggers 30 days before expiry, so a 15-day cert will show the alert immediately upon restart and validation. You can view it in the UI under **Alert > Notifications** (bell icon in the top nav bar) or via the REST API at `/api/notifications` (filter by type="CERTIFICATE_EXPIRATION").
+
+### Prerequisites
+- OpenSSL 1.1+ on the manager node.
+- Backup your `hub_cert-volume`: `docker run --rm -v blackduck_hub_cert-volume:/data -v $(pwd):/backup alpine tar czf /backup/hub_cert_backup.tar.gz -C /data .`
+- Know your stack name (e.g., `blackduck`).
+
+### Step 1: Prepare Directory and Stop Services
+```
+mkdir /tmp/blackduck-certs && cd /tmp/blackduck-certs
+docker stack deploy blackduck --compose-file docker-compose.yml scale webapp=0 postgres=0 nginx=0 cfssl=0
+docker volume rm blackduck_hub_cert-volume
+docker volume create blackduck_hub_cert-volume
+```
+
+### Step 2: Generate Root CA (15-Day Expiry)
+```
+# Generate CA private key
+openssl genrsa -out ca-key.pem 2048
+
+# Create CA config (basic for self-signed root)
+cat > ca-config.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_ca
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = California
+L = Mountain View
+O = Synopsys
+OU = Black Duck
+CN = Black Duck Root CA
+
+[v3_ca]
+basicConstraints = critical, CA:true
+keyUsage = keyCertSign, cRLSign
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+EOF
+
+# Generate CA cert (self-signed, 15 days)
+openssl req -x509 -new -nodes -key ca-key.pem -sha256 -days 15 -out ca.pem -config ca-config.cnf
+```
+
+### Step 3: Generate Server Cert (15-Day Expiry, Signed by CA)
+```
+# Generate server private key
+openssl genrsa -out server-key.pem 2048
+
+# Create server config
+cat > server-config.cnf <<EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+C = US
+ST = California
+L = Mountain View
+O = Synopsys
+OU = Black Duck
+CN = blackduck-server-internal
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth, clientAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+DNS.2 = hub.local
+IP.1 = 127.0.0.1
+EOF
+
+# Generate CSR
+openssl req -new -key server-key.pem -out server.csr -config server-config.cnf
+
+# Sign CSR with CA (15 days)
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out server.pem -days 15 -sha256 -extfile server-config.cnf -extensions v3_req
+```
+
+### Step 4: Copy Certs to Volume
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine sh -c "cp /work/ca.pem /certs/ && cp /work/server.pem /certs/ && cp /work/server-key.pem /certs/"
+```
+
+### Step 5: Verify and Restart
+Check expiry (should be ~Nov 22, 2025):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine openssl x509 -in /certs/server.pem -text -noout | grep "Not After"
+```
+
+Restart:
+```
+docker stack deploy -c docker-compose.yml blackduck
+```
+
+Monitor: `docker service logs blackduck_nginx` (look for TLS handshake success; errors like "certificate verify failed" mean SAN/CN mismatch—adjust configs).
+
+### Viewing the Expiry Alert
+- **UI**: Log in to Black Duck Hub > Click the bell icon (Notifications) in the top-right nav bar. The alert will appear as a "Internal SSL Certificate Expiration" notification (high priority, since <30 days remain). It's also viewable in **Alert > All Notifications** if integrated with Black Duck Alert.
+- **API**: Use a tool like curl with your API token:
+  ```
+  curl -H "Authorization: Bearer $TOKEN" -H "Accept: application/json" "https://your-hub/api/notifications?filter=type%3DCERTIFICATE_EXPIRATION"
+  ```
+  This returns JSON with alert details (e.g., cert name, days remaining). Docs: Black Duck REST API > Notifications endpoint.
+
+This OpenSSL method is quicker (no image pulls/builds) and repeatable. If issues arise (e.g., Black Duck version-specific validation), fall back to cfssl. For production, use longer expiries and automate rotation.
