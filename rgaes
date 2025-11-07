@@ -1,0 +1,72 @@
+The `/api/cert-expiration-checks/internal` endpoint (part of Black Duck's internal SSL certificate monitoring, introduced in 2024.7.0) queries the loaded internal server certificate's expiry date directly from the runtime config. If it's still reporting 2028 (the default ~3-year expiry from initial generation), our manual 15-day cert wasn't persisted—likely because the cfssl service started during the full stack deploy, detected "invalid" or missing certs in the volume (e.g., due to path/format mismatches or validation fails), and regenerated them with its default config.
+
+This is a common gotcha in Swarm setups: cfssl is designed for one-time bootstrap but can overwrite if it runs post-copy. Let's confirm and fix it with a targeted redeploy that skips cfssl entirely after our manual placement.
+
+### Step 1: Verify Current Cert in Volume
+Run this on your manager node to check what's actually loaded (replace `blackduck` with your stack name if different):
+```
+docker run --rm -v blackduck_hub_cert-volume:/certs alpine sh -c "apk add --no-cache openssl && echo '=== Server Cert Expiry ===' && openssl x509 -in /certs/server.pem -text -noout | grep 'Not After' && echo '=== Issuer DN ===' && openssl x509 -in /certs/server.pem -text -noout | grep -A5 'Issuer:'"
+```
+- If "Not After" shows ~2028-11-07 (or similar long date), cfssl overwrote it—proceed to Step 2.
+- If ~2025-11-22, the cert is correct but the API isn't reflecting it (rare; restart webapp: `docker service update blackduck_webapp --force` and recheck API).
+- Also note the Issuer: should include "O = Blackduck Software Inc." from our last update.
+
+### Step 2: Recreate Volume, Copy Manual Certs, and Deploy Without cfssl
+This ensures cfssl never touches the volume post-copy.
+
+```
+# Stop everything and clear volume
+docker stack deploy blackduck --compose-file docker-compose.yml scale webapp=0 postgres=0 nginx=0 auth-server=0 scan-server=0 certmanager=0 cfssl=0
+docker volume rm blackduck_hub_cert-volume
+docker volume create blackduck_hub_cert-volume
+
+# Regenerate certs (use the updated configs from our last response with O=Blackduck Software Inc.)
+cd /tmp/blackduck-certs  # Or your dir
+rm -f *.pem *.csr *.cnf  # Fresh start
+# Run Steps 2 & 3 from previous response (CA and server cert gen with -days 15)
+# ... (openssl commands here; expiry will be ~Nov 22, 2025)
+
+# Copy to volume
+docker run --rm -v blackduck_hub_cert-volume:/certs -v $(pwd):/work alpine sh -c "cp /work/ca.pem /certs/ && cp /work/server.pem /certs/ && cp /work/server-key.pem /certs/"
+
+# Verify copy (should show Nov 22, 2025)
+# (Run the check from Step 1)
+```
+
+### Step 3: Deploy Stack with cfssl Disabled
+Edit your `docker-compose.yml` temporarily (or use `--scale cfssl=0` if supported in your deploy command):
+```
+# Add/override at the end of docker-compose.yml
+deploy:
+  replicas: 0  # For cfssl service only; comment out after
+```
+Or, for a one-shot deploy:
+```
+docker stack deploy -c docker-compose.yml blackduck --with-registry-auth
+# Immediately scale cfssl to 0 (if it snuck in)
+docker service scale blackduck_cfssl=0
+```
+
+- This starts all dependent services (nginx, postgres, etc.) using the volume's manual certs without triggering regeneration.
+- Monitor startup (give 10-15 min for DB migrations/auth init):
+  ```
+  watch 'docker service ls | grep -v cfssl'  # Replicas to 1/1
+  docker service logs -f --since 2m blackduck_nginx  # Look for "SSL cert loaded" or handshake success
+  docker service logs -f --since 2m blackduck_postgres  # "ready to accept connections"; no "Failed certmanager" or issuer check fails
+  ```
+
+### Step 4: Confirm in API and Alerts
+Once services are up (webapp responsive):
+- Hit the endpoint: `curl -H "Authorization: Bearer $TOKEN" "https://your-hub/api/cert-expiration-checks/internal"`
+  - Should now show `"expiryDate": "2025-11-22T..."` (or ISO equiv).
+- Check notifications: `curl -H "Authorization: Bearer $TOKEN" "https://your-hub/api/notifications?filter=type%3DCERTIFICATE_EXPIRATION"`
+  - Expect an alert entry with details (high priority since <30 days left).
+- UI: Bell icon > Notifications; look for "Internal SSL Certificate Expiration" alert.
+
+### Notes
+- **Why skip cfssl?** It's only needed for initial gen; Black Duck services load from `/certs/server.pem` etc. in the volume. Scaling it to 0 permanently is fine post-bootstrap (document it in your ops notes).
+- **If still 2028**: Share the output from Step 1 verify + nginx/postgres log snippets (e.g., any "certificate load failed"). Could be path mismatch (e.g., expects `/certs/hub-server.crt`—check via `docker run --rm -v blackduck_hub_cert-volume:/certs alpine ls -la /certs/` and rename files if needed).
+- **Revert**: To restore defaults, scale cfssl=1, let it run 1-2 min, then scale=0.
+- For automation, consider the custom cfssl image approach from earlier— it bakes in the short expiry so regeneration uses it.
+
+This should nail the short expiry and trigger the alert reliably. If the verify shows the right date but API doesn't, it might be a cache—force a full stack restart via `docker stack rm blackduck && docker stack deploy ...`.
