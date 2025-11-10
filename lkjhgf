@@ -1,0 +1,64 @@
+To test the internal SSL certificate expiration alert in Black Duck (introduced in version 2024.7.0, which notifies 30 days before expiration), you can replace the root CA certificate used by the cfssl service with a self-signed one expiring in 15 days. This will trigger the alert since 15 days is within the 30-day threshold. The cfssl container generates and manages internal TLS certificates for services like PostgreSQL, NGINX, and inter-service communication.
+
+**Important caveats:**
+- This affects internal TLS, so services may briefly disrupt during rotation (e.g., authentication or database connections). Test in a staging environment first.
+- Regenerating the root CA typically requires regenerating dependent internal certificates, but updating the root secret often propagates automatically upon redeploy.
+- Confirm your Black Duck version supports the alert (2024.7.0+).
+- If your deployment uses custom CA configurations (e.g., `AUTH_CUSTOM_CA` secret), incorporate those.
+
+### Step-by-Step Guide
+
+1. **Generate a new self-signed root CA certificate with 15-day expiration:**
+   Use OpenSSL (available on most systems; install if needed via your package manager). This creates a root cert/key pair.
+
+   ```
+   openssl req -x509 -newkey rsa:4096 -keyout new_root_ca.key -out new_root_ca.crt -days 15 -nodes -subj "/C=US/ST=YourState/L=YourCity/O=YourOrg/CN=BlackDuckInternalRootCA"
+   ```
+
+   - Verify the expiration: `openssl x509 -in new_root_ca.crt -noout -dates` (should show `notAfter` ~15 days from now).
+   - Note: The subject (`/CN=...`) should match your existing root CA's common name for compatibility—check your current one via Step 2.
+
+2. **Identify the root CA Docker secret(s):**
+   The root CA is stored as Docker secret(s) in Swarm. The cfssl service uses secrets like `hub_cfssl_ca` (for the cert) and `hub_cfssl_ca_key` (for the key), but names may vary by stack (e.g., prefixed with your stack name like `blackduck_cfssl_ca`).
+
+   - List secrets: `docker secret ls | grep -i cfssl` or `docker secret ls | grep -i ca`.
+   - Inspect a candidate: `docker secret inspect <suspected_secret_name> --format '{{index .Spec.Data "content"}}' | base64 -d > temp_cert.pem` then `openssl x509 -in temp_cert.pem -noout -subject` to confirm it's the root CA (look for "CA:TRUE" in `openssl x509 -in temp_cert.pem -noout -text`).
+
+   If unsure, check your `docker-compose.yml` (from the GitHub repo) for secrets referenced in the `cfssl` service (under `secrets:`).
+
+3. **Update the Docker secret(s):**
+   - Remove the old secret(s): `docker secret rm hub_cfssl_ca` (repeat for `hub_cfssl_ca_key` if separate).
+   - Create new secret(s) from your generated files:
+     ```
+     echo "$(base64 -w 0 new_root_ca.crt)" | docker secret create hub_cfssl_ca -
+     echo "$(base64 -w 0 new_root_ca.key)" | docker secret create hub_cfssl_ca_key -
+     ```
+     - The `base64` encoding is required for secret creation; adjust paths/names as needed.
+   - (Optional) If other internal cert secrets exist (e.g., for PostgreSQL or NGINX, like `hub_postgres_server_cert`), you may need to regenerate and update those too using cfssl commands inside the container (see Step 4 for access). But starting with the root often suffices for the alert trigger.
+
+4. **Redeploy the Black Duck stack to propagate changes:**
+   - Update the stack: `docker stack deploy -c docker-compose.yml <your_stack_name>` (e.g., `blackduck`; use the file from the GitHub repo).
+   - This detects the secret hash change, restarts affected containers (including cfssl), and regenerates dependent internal certs.
+   - Monitor logs: `docker service logs <your_stack_name>_cfssl` for cert generation/rotation messages. Look for errors like TLS handshake failures and resolve by verifying the new CA's subject/key match.
+   - If needed, manually regenerate internal certs:
+     - Exec into cfssl container: `docker exec -it $(docker ps | grep cfssl | awk '{print $1}') sh`.
+     - Use cfssl tools inside (e.g., `cfssl gencert -ca=new_root_ca.crt -cakey=new_root_ca.key config.json csr.json | cfssljson -bare postgres-server`) then update related secrets.
+
+5. **Verify the alert in the UI:**
+   - Log in to Black Duck UI (https://<your-hub-url>).
+   - Navigate to **Administration > Alerts** (or **Notifications** if integrated with Black Duck Alert).
+   - The internal SSL expiration alert should appear within minutes/hours (the system polls certs periodically). It will list the expiring cert (root CA) and details like expiration date.
+   - If no alert, force a scan/check by restarting the relevant services or waiting for the next cron job (configurable in Alert settings).
+
+### Troubleshooting
+- **No secret found?** Your deployment might auto-generate on init. Scale cfssl to 0 (`docker service scale <stack>_cfssl=0`), remove any CA-related volumes/secrets, scale back to 1, and let it regenerate—but use your new cert/key as env vars or initial files in cfssl config.
+- **Service disruption?** Rollback: Restore old secret from backup (`docker secret create hub_cfssl_ca old_cert.b64`) and redeploy.
+- **Alert not triggering?** Ensure Black Duck Alert is integrated/enabled (see repo's Alert setup). Check logs: `docker service logs <stack>_alert`.
+- **Custom setup?** If using external DB or proxy certs, update those too (secrets like `HUB_PROXY_CERT_FILE`).
+
+For official details, see:
+- [Rotating certs and secrets on Docker Swarm](https://community.blackduck.com/s/article/Black-Duck-HUB-Rotating-Certs-and-Secrets-on-Docker-Swarm)
+- [Updating expiring certificates](https://community.blackduck.com/s/article/Black-Duck-HUB-Alert-How-to-update-expiring-certificates)
+- [Root CA expiration resolution](https://sig-synopsys.my.site.com/community/s/article/Black-Duck-Down-Root-CA-Cert-in-cfssl-Container-Expired)
+
+If you share output from `docker secret ls` or your docker-compose.yml snippet, I can refine the secret names/steps.
