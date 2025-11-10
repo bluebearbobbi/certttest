@@ -1,0 +1,89 @@
+If no Docker secrets appear related to cfssl or internal certs (e.g., via `docker secret ls`), that's expected in a standard Black Duck Docker Swarm deployment. The internal TLS certificates (including the root CA) are generated and persisted in a Docker **volume** named `hub_cert-volume` (or prefixed with your stack name, like `blackduck_hub_cert-volume` if your stack is `blackduck`).
+
+The cfssl service mounts this volume to `/etc/cfssl` inside the container and generates certs there on initial startup (or if files are missing). The root CA files are typically `ca.pem` (cert) and `ca-key.pem` (key). Dependent leaf certs (for PostgreSQL, NGINX, RabbitMQ, etc.) are also stored here as PEM files.
+
+To replace the root CA with a self-signed one expiring in 15 days (triggering the 30-day alert) while minimizing disruption, follow these steps. **Warning:** This will cause brief downtime (5-15 minutes) for services relying on internal TLS (e.g., DB connections, API calls). Test in non-prod. Backup the volume first: `docker run --rm -v hub_cert-volume:/etc/cfssl -v $(pwd):/backup alpine tar czf /backup/certs-backup.tar.gz -C /etc/cfssl .`
+
+### Step-by-Step
+
+1. **Confirm the volume and stop cfssl:**
+   ```
+   docker volume ls | grep cert
+   ```
+   - Note the exact name (e.g., `hub_cert-volume`).
+   ```
+   docker service scale <stack>_cfssl=0  # e.g., blackduck_cfssl=0
+   ```
+   - Wait for it to stop: `docker service ps <stack>_cfssl`
+
+2. **Generate the short-lived root CA (on your host):**
+   Match the subject to your existing CA for compatibility (check via Step 3 if needed).
+   ```
+   openssl req -x509 -newkey rsa:4096 -keyout new_ca.key -out new_ca.crt -days 15 -nodes -subj "/C=US/ST=CA/L=San Francisco/O=Black Duck Software, Inc./OU=Internal/CN=hub-ca"
+   ```
+   - Verify: `openssl x509 -in new_ca.crt -noout -dates` (notAfter should be ~Nov 25, 2025).
+   - If your existing CN differs, inspect the current: See Step 3.
+
+3. **Get the volume mount point and backup/replace the root CA files:**
+   ```
+   VOLUME_NAME="hub_cert-volume"  # Replace with your volume name
+   MOUNTPOINT=$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')
+   echo $MOUNTPOINT  # e.g., /var/lib/docker/volumes/hub_cert-volume/_data
+   ```
+   - Backup root files: `cp $MOUNTPOINT/ca.pem $MOUNTPOINT/ca.pem.bak && cp $MOUNTPOINT/ca-key.pem $MOUNTPOINT/ca-key.pem.bak`
+   - To match subject: `openssl x509 -in $MOUNTPOINT/ca.pem.bak -noout -subject`
+   - Replace:
+     ```
+     cp new_ca.crt $MOUNTPOINT/ca.pem
+     cp new_ca.key $MOUNTPOINT/ca-key.pem
+     ```
+
+4. **Regenerate leaf certificates with the new root CA (to avoid TLS failures):**
+   The cfssl entrypoint regenerates missing leaf certs on startup. We'll force this by removing old leaves in a temporary container.
+   ```
+   docker run --rm -v $VOLUME_NAME:/etc/cfssl -it blackducksoftware/blackduck-cfssl:2024.10.0 sh  # Use your Black Duck version tag
+   ```
+   - Inside the container:
+     ```
+     cd /etc/cfssl
+     ls  # Note files: expect ca.pem/ca-key.pem (new), plus configs like *-config.json, *-csr.json, and old leaf PEMs like postgres-server.pem, nginx.pem, etc.
+     # Backup leaves if desired: cp *-server.pem *-client.pem etc. /tmp/ (but optional for test)
+     # Remove old leaves (keep CA, configs, CSRs):
+     rm -f *-key.pem nginx.pem rabbitmq.pem postgres-server.pem postgres-client.pem webapp-client.pem  # Adjust based on ls output; remove all .pem except ca*.pem and any *-config.json/*-csr.json
+     exit
+     ```
+   - This ensures leaves are re-signed by the new CA.
+
+5. **Restart cfssl and redeploy the stack:**
+   ```
+   docker service scale <stack>_cfssl=1
+   ```
+   - Monitor: `docker service logs -f <stack>_cfssl` (look for "generated certificate" messages; errors may indicate mismatched subjects—revert and adjust).
+   ```
+   docker stack deploy -c docker-compose.yml <stack>
+   ```
+   - This propagates new certs to other services (e.g., PostgreSQL pulls from cfssl). Monitor overall logs: `docker service logs <stack>`.
+   - Services may restart 1-2 times; full recovery ~5-10 min.
+
+6. **Verify the alert in the UI:**
+   - Log in to Black Duck (https://<your-hub-url>).
+   - Go to **Administration > Alerts** (or **Settings > Notifications** if using Black Duck Alert integration).
+   - The "Internal SSL Certificate Expiration" alert should appear soon (system polls certs ~daily; to force, restart the `alert` or `notification` service: `docker service scale <stack>_alert=0 && docker service scale <stack>_alert=1`).
+   - It will reference the root CA expiration (~15 days) and suggest renewal.
+   - Check cert: Exec into cfssl (`docker exec -it <cfssl_container> sh`), then `openssl x509 -in /etc/cfssl/ca.pem -noout -dates`.
+
+### Rollback if Needed
+- Restore: `cp $MOUNTPOINT/ca.pem.bak $MOUNTPOINT/ca.pem && cp $MOUNTPOINT/ca-key.pem.bak $MOUNTPOINT/ca-key.pem`, then redeploy.
+- Or restore full backup: `docker run --rm -v $VOLUME_NAME:/etc/cfssl -v $(pwd):/backup alpine tar xzf /backup/certs-backup.tar.gz -C /etc/cfssl`
+
+### Troubleshooting
+- **Volume not found?** Run `docker volume ls`—it may be `<stack>_hub_cert_volume`. If missing, your deployment might use external certs; check `docker-compose.yml` under `cfssl.volumes`.
+- **Generation fails?** Configs/CSRs are in the image; if ls shows none, the entrypoint may embed them. Manually generate leaves inside the temp container, e.g.:
+  ```
+  cfssl gencert -ca=ca.pem -ca-key=ca-key.pem -config=postgres-config.json -profile=server postgres-csr.json | cfssljson -bare postgres-server
+  ```
+  (Repeat for each; find configs via `find / -name "*-config.json" 2>/dev/null` in container.)
+- **No alert?** Ensure version 2024.7.0+ and Alert integration enabled (see repo docs). Check alert logs: `docker service logs <stack>_alert`.
+- **Chain validation errors?** All leaves must be regenerated; if skipped, services fail with "unknown CA".
+
+For more, see [Black Duck Down - Root CA Cert Expired](https://sig-synopsys.my.site.com/community/s/article/Black-Duck-Down-Root-CA-Cert-in-cfssl-Container-Expired) (resolution: prune volume and redeploy) or [Update Expiring Certs](https://community.blackduck.com/s/article/Black-Duck-HUB-Alert-How-to-update-expiring-certificates). Share `docker volume ls` or `ls` from the temp container for tweaks.
