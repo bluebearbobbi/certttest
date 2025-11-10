@@ -1,2 +1,23 @@
-cd /opt/blackduck/hub/webserver/security
-openssl req -new -x509 -key hub-webserver.key -out hub-webserver.crt -days 20 -subj "/C=US/ST=YourState/L=YourCity/O=YourOrg/CN=hub.yourdomain.com"
+Yes, absolutely—you don't need the `$MOUNTPOINT` variable at all if you prefer. Just inline the `docker volume inspect` command directly in your `cp` statements. It evaluates the path on the fly each time, so it's efficient and avoids variable scoping issues.
+
+### Updated Copy Commands (Inline Version)
+Assuming `$VOLUME_NAME` is set (e.g., to `hub_cert-volume`) or replace it inline too:
+
+#### Backup First (if not done):
+```
+sudo cp "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca.pem" "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca.pem.bak"
+sudo cp "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca-key.pem" "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca-key.pem.bak"
+```
+
+#### Copy New Certs:
+```
+sudo cp new_ca.crt "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca.pem"
+sudo cp new_ca.key "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca-key.pem"
+```
+
+- The `$(...)` runs the inspect command and substitutes the path (e.g., `/var/lib/docker/volumes/hub_cert-volume/_data`) right into the `cp` target.
+- Verify as before: `sudo openssl x509 -in "$(docker volume inspect $VOLUME_NAME --format '{{ .Mountpoint }}')/ca.pem" -noout -dates`
+
+If `$VOLUME_NAME` isn't set in your shell, hardcode it: Replace `$VOLUME_NAME` with `hub_cert-volume` (or your exact name).
+
+This keeps things simple—no scripts or vars needed. Once copied, proceed to step 4 (temp container to nuke old leaves). Hit me with any output/errors if it barfs!
