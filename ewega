@@ -11,3 +11,16 @@ docker run --rm -v hub_cert-volume:/certs -v /blackduck:/work alpine sh -c "
   chmod 644 /certs/*.pem &&
   echo 'Done: ' && ls -la /certs/
 "
+
+
+
+
+# Check if dir exists and what's inside (exact names/case matter)
+ls -la /blackduck/
+
+# If "No such file or directory", find where certs really are
+find / -name "ca.pem" 2>/dev/null  # Searches whole FS for ca.pem (takes ~1 min; adjust name if different)
+# Or user-home focused: find /home -name "*.pem" 2>/dev/null
+
+# If files found elsewhere, move them: sudo mv /found/path/ca.pem /blackduck/ (repeat for others)
+# Then: mkdir -p /blackduck && sudo chown -R ubuntu:ubuntu /blackduck/  # Adjust 'ubuntu' to your username
