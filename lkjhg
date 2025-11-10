@@ -1,0 +1,2 @@
+cd /opt/blackduck/hub/webserver/security
+openssl req -new -x509 -key hub-webserver.key -out hub-webserver.crt -days 20 -subj "/C=US/ST=YourState/L=YourCity/O=YourOrg/CN=hub.yourdomain.com"
