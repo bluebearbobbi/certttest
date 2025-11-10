@@ -1,0 +1,13 @@
+# Fresh volume
+docker volume rm hub_cert-volume
+docker volume create hub_cert-volume
+
+# Copy (tweak filenames if ls showed diffs, e.g., .crt)
+docker run --rm -v hub_cert-volume:/certs -v /blackduck:/work alpine sh -c "
+  echo 'Copying...' &&
+  cp /work/ca.pem /certs/ &&
+  cp /work/server.pem /certs/ &&
+  cp /work/server-key.pem /certs/ &&
+  chmod 644 /certs/*.pem &&
+  echo 'Done: ' && ls -la /certs/
+"
