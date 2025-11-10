@@ -1,43 +1,10 @@
-### Simplified Generation and Copy (Using sudo docker cp)
-Since mounts are flaking (likely sudo-related perms), we'll generate certs in your home dir (`~/blackduck-certs`), start a minimal nginx container (it mounts `hub_cert-volume`), and `sudo docker cp` the files directly into it. This persists via the volume. Assumes OpenSSL installed (`sudo apt install openssl` if not).
-
-#### Step 1: Generate Certs on Host (15-Day Expiry)
-```
-mkdir -p ~/blackduck-certs && cd ~/blackduck-certs
-# Clear any old files
-rm -f *.pem *.csr *.cnf
-
-# CA Generation
-openssl genrsa -out ca-key.pem 2048
-cat > ca-config.cnf <<EOF
-[req]
-distinguished_name = req_distinguished_name
-x509_extensions = v3_ca
-prompt = no
-[req_distinguished_name]
-C = US
-ST = California
-L = Mountain View
-O = Blackduck Software Inc.
-OU = Black Duck
-CN = Black Duck Root CA
-[v3_ca]
-basicConstraints = critical, CA:true
-keyUsage = keyCertSign, cRLSign
-subjectAltName = @alt_names
-[alt_names]
-DNS.1 = localhost
-IP.1 = 127.0.0.1
-EOF
-openssl req -x509 -new -nodes -key ca-key.pem -sha256 -days 15 -out ca.pem -config ca-config.cnf
-
-# Server Cert Generation
-openssl genrsa -out server-key.pem 2048
-cat > server-config.cnf <<EOF
+cd ~/blackduck-certs
+cat > server-config.cnf << 'EOF'
 [req]
 distinguished_name = req_distinguished_name
 req_extensions = v3_req
 prompt = no
+
 [req_distinguished_name]
 C = US
 ST = California
@@ -45,61 +12,29 @@ L = Mountain View
 O = Blackduck Software Inc.
 OU = Black Duck
 CN = blackduck-server-internal
+
 [v3_req]
 basicConstraints = CA:FALSE
 keyUsage = nonRepudiation, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth, clientAuth
 subjectAltName = @alt_names
+
 [alt_names]
 DNS.1 = localhost
 DNS.2 = hub.local
 IP.1 = 127.0.0.1
 EOF
+
+
+openssl req -text -noout -verify -config server-config.cnf
+
 openssl req -new -key server-key.pem -out server.csr -config server-config.cnf
 openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out server.pem -days 15 -sha256 -extfile server-config.cnf -extensions v3_req
+rm server.csr  # Cleanup
 
-# Verify local (should show ~Nov 25, 2025)
-openssl x509 -in server.pem -text -noout | grep -E "Not After|Issuer:"
-ls -la *.pem  # Confirm files
-```
 
-#### Step 2: Start Minimal Nginx (Mounts Volume)
-Scale to start only nginx (assumes stack `blackduck`; adjust if different):
-```
-sudo docker stack deploy blackduck --compose-file docker-compose.yml scale cfssl=0 webapp=0 postgres=0 auth-server=0 scan-server=0 certmanager=0 nginx=1
-```
-Wait ~1 min: `watch 'sudo docker service ls | grep nginx'` (replicas 1/1).
+openssl x509 -in server.pem -text -noout | grep -E "Not After|Issuer:|Subject Alternative Name"
+openssl verify -CAfile ca.pem server.pem  # Should say "server.pem: OK"
 
-Get container ID: `sudo docker ps | grep nginx` (e.g., `abc123_blackduck_nginx.1.def456`—note full ID).
 
-#### Step 3: Copy Files to Container (/certs/ Path)
-Replace `<container-id>` with yours (e.g., `abc123_blackduck_nginx.1.def456`):
-```
-sudo docker cp ~/blackduck-certs/ca.pem <container-id>:/certs/ca.pem
-sudo docker cp ~/blackduck-certs/server.pem <container-id>:/certs/server.pem
-sudo docker cp ~/blackduck-certs/server-key.pem <container-id>:/certs/server-key.pem
-```
-- This writes to the mounted volume, so all services see it on start.
 
-#### Step 4: Verify in Container
-Exec in: `sudo docker exec -it <container-id> sh`
-Inside:
-```
-ls -la /certs/  # Should show the 3 PEM files
-openssl x509 -in /certs/server.pem -text -noout | grep -E "Not After|Issuer:"  # ~Nov 25, Issuer with Blackduck Software Inc.
-exit
-```
-From host (alt verify): `sudo docker run --rm -v hub_cert-volume:/certs alpine sh -c "apk add --no-cache openssl && openssl x509 -in /certs/server.pem -text -noout | grep 'Not After'"`
-
-#### Step 5: Reload and Deploy Full Stack
-```
-sudo docker service update blackduck_nginx --force  # Reloads cert in nginx
-sudo docker stack deploy -c docker-compose.yml blackduck  # Full deploy (cfssl=0 via scale if needed)
-```
-Wait 10-15 min: `sudo docker service logs -f --since 2m blackduck_nginx` (look for SSL success, no errors).
-
-#### Step 6: Test Expiry Alert
-- API: `curl -H "Authorization: Bearer $TOKEN" "https://your-hub/api/cert-expiration-checks/internal"` (expect `"expiryDate": "2025-11-25T..."`).
-- UI: Login > Bell icon > Notifications (should show internal cert expiry alert).
-
-If copy fails (e.g., wrong /certs/ path), check mount in exec: `mount | grep cert` or `find / -name server.pem`. This bypasses mounts entirely—should work with sudo. Share verify output if issues!
