@@ -1,0 +1,74 @@
+To trigger the built-in internal SSL certificate expiration notification in your Black Duck SCA deployment (which fires when the root CA expires within 30 days), you need to replace the root CA certificate in the `hub_cert-volume` with a new self-signed one that expires in fewer than 30 days (e.g., 20 days). This is the simplest, most direct way to simulate the condition without modifying source code, configs, or relying on time travel. The notification is tied to the root CA (stored as `ca.pem`), and changing it will force the `hub_cfssl` service (and dependent services) to regenerate child certificates on restart—leveraging the fact that downtime is acceptable.
+
+This assumes a standard Docker Swarm setup where the volume is accessible via temporary containers (no host-level mounts needed). All commands run on your Swarm manager node.
+
+### Step 1: Shut Down the Stack
+```
+docker stack rm hub
+```
+- Wait for all services to stop: `watch 'docker ps | grep hub'` (exit when nothing shows).
+
+### Step 2: Inspect the Volume Contents
+Run this to list files and confirm `ca.pem` and `ca-key.pem` exist (these are the root CA cert and private key):
+```
+docker run --rm -v hub_cert-volume:/data alpine ls -la /data
+```
+- Expected output includes `ca.pem` and `ca-key.pem` (possibly others like service-specific certs, but focus on these).
+- If the names differ (unlikely), adjust the commands below accordingly.
+
+### Step 3: Backup the Existing Root CA
+```
+docker run --rm -v hub_cert-volume:/data alpine sh -c "cp ca.pem ca.pem.bak && cp ca-key.pem ca-key.pem.bak"
+```
+- This preserves your originals in case of issues.
+
+### Step 4: Extract the Current Subject DN
+You need the exact subject (DN) from the existing `ca.pem` to match Black Duck's expectations for the new cert:
+```
+docker run --rm -v hub_cert-volume:/data alpine openssl x509 -in /data/ca.pem -noout -subject
+```
+- Output example: `subject=CN = Black Duck CA, O = Synopsys, L = San Francisco, ST = California, C = US` (yours may vary slightly).
+- Copy this full string (including spaces and equals signs) for Step 5.
+
+### Step 5: Generate and Replace with a Short-Lived Root CA
+Replace `<YOUR_SUBJECT_HERE>` with the exact output from Step 4 (wrap in quotes if it has spaces). This creates a new 2048-bit RSA self-signed root CA valid for 20 days:
+```
+docker run --rm -v hub_cert-volume:/data alpine sh -c '
+SUBJ="<YOUR_SUBJECT_HERE>"
+openssl genpkey -algorithm RSA -out new-ca-key.pem -pkeyopt rsa_keygen_bits:2048
+openssl req -new -x509 -days 20 -key new-ca-key.pem -out new-ca.pem -subj "$SUBJ" -addext "basicConstraints=CA:TRUE,keyUsage=keyCertSign,cRLSign"
+mv new-ca.pem ca.pem
+mv new-ca-key.pem ca-key.pem
+'
+```
+- Notes:
+  - `-days 20` sets expiry ~20 days from now (adjust to 1-29 if needed, but <30 to trigger the alert).
+  - The `-addext` ensures it's a valid CA cert (critical for `hub_cfssl` to use it for signing child certs).
+  - If your Alpine image's OpenSSL lacks `genpkey` (rare), use `openssl genrsa -out new-ca-key.pem 2048` instead.
+
+### Step 6: Verify the New Cert
+```
+docker run --rm -v hub_cert-volume:/data alpine openssl x509 -in /data/ca.pem -noout -dates
+```
+- Expected: `notAfter=Dec 30 21:00:00 2025 GMT` (or similar, ~20 days from now).
+- Also re-check the subject: `docker run --rm -v hub_cert-volume:/data alpine openssl x509 -in /data/ca.pem -noout -subject` (should match original).
+
+### Step 7: Restart the Stack
+```
+docker stack deploy -c <path-to-your-docker-compose.yml> hub
+```
+- Monitor startup: `docker service ls | grep hub` and `docker service logs hub_cfssl`.
+- The `hub_cfssl` service will detect the new root CA and re-issue short-lived internal certs for services like PostgreSQL, Nginx, etc. (this may take 5-10 minutes; logs will show CFSSL activity).
+- If services fail to start (e.g., due to mismatched child certs), delete the volume entirely (`docker volume rm hub_cert-volume`) to force full regeneration—then repeat Steps 4-7 (the system will auto-create a new long-lived CA, so you'd need to re-apply Step 5 immediately after).
+
+### Step 8: Confirm the Trigger
+- Once running, query the endpoint: `curl -u <admin-user>:<password> https://<your-hub-url>/api/cert-expiration-checks/internal`
+  - Should now show expiry <30 days.
+- The built-in alert (via Black Duck Alert integration) should fire automatically on the next check cycle (typically daily, but may be immediate on detection). Check your configured notification channels (e.g., email) for the "Internal SSL Certificate Expiration" alert.
+- If no alert: Verify Alert is enabled/configured for this event in the UI (Administration > Alert > Notifications).
+
+### Cleanup (Optional)
+- To revert: Stop the stack again, then restore: `docker run --rm -v hub_cert-volume:/data alpine sh -c "mv ca.pem.bak ca.pem && mv ca-key.pem.bak ca-key.pem"`, and redeploy.
+- The short-lived CA will cause another alert/renewal in ~20 days—revert before then to avoid production issues.
+
+This process takes ~10-15 minutes and requires no custom images or external tools. If you hit errors (e.g., service startup fails), share the `hub_cfssl` logs for troubleshooting.
